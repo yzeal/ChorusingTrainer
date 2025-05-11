@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QComboBox, QCheckBox, QLineEdit,
     QFrame, QSizePolicy, QFileDialog, QMessageBox, QSlider, QDialog, QFormLayout, QDialogButtonBox, QKeySequenceEdit, QSpinBox
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QUrl, QRect, QPoint
+from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QUrl, QRect, QPoint, QPointF
 from PyQt6.QtGui import QImage, QPixmap, QDragEnterEvent, QDropEvent, QPainter, QKeySequence, QShortcut, QIntValidator, QPen
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -178,6 +178,32 @@ class DraggableLineEdit(QLineEdit):
                 except ValueError:
                     pass
         super().mouseMoveEvent(event)
+
+class PlaybackIndicator(pg.GraphicsObject):
+    def __init__(self, color='r', width=4):
+        super().__init__()
+        self._x = 0
+        self.color = color
+        self.width = width
+        self.setZValue(100)
+
+    def setValue(self, x):
+        self._x = x
+        self.update()
+
+    def paint(self, p, *args):
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = pg.mkPen(self.color, width=self.width)
+        p.setPen(pen)
+        vb = self.getViewBox()
+        if vb is None:
+            return
+        y_min, y_max = vb.viewRange()[1]
+        p.drawLine(QPointF(self._x, y_min), QPointF(self._x, y_max))
+
+    def boundingRect(self):
+        # Fixed large rectangle to avoid feedback loop
+        return pg.QtCore.QRectF(-1e6, -1e6, 2e6, 2e6)
 
 class PitchAccentApp(QMainWindow):
     def __init__(self):
@@ -462,8 +488,10 @@ class PitchAccentApp(QMainWindow):
         self.pg_region.setZValue(10)  # Make sure region is above the plot
         self.pg_plot.addItem(self.pg_region)
         self.pg_region.sigRegionChanged.connect(self._on_pg_region_changed)
-        self.pg_playback_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('r', width=2))
+        self.pg_playback_line = PlaybackIndicator(color='r', width=4)
+        self.pg_user_playback_line = PlaybackIndicator(color='r', width=4)
         self.pg_plot.addItem(self.pg_playback_line)
+        self.pg_user_plot.addItem(self.pg_user_playback_line)
         # Connect mouse click events for selection
         self.pg_plot.scene().sigMouseClicked.connect(self.on_mouse_clicked)
         # Step 6: Prepare user pitch curve for separate plot
@@ -840,7 +868,7 @@ class PitchAccentApp(QMainWindow):
         self.pg_region.sigRegionChanged.connect(self._on_pg_region_changed)
         
         # Add playback line
-        self.pg_playback_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('r', width=2))
+        self.pg_playback_line = PlaybackIndicator(color='r', width=4)
         self.pg_plot.addItem(self.pg_playback_line)
         
         # Plot pitch curve more efficiently
@@ -1044,9 +1072,6 @@ class PitchAccentApp(QMainWindow):
         est_pos = self._last_playback_pos + (now - self._last_playback_time)
         max_end = self._clip_duration - self._default_selection_margin - 0.05
         est_pos = max(0.0, min(est_pos, max_end))
-        # Use PyQtGraph's x range for indicator positioning
-        x_min, x_max = self.pg_plot.getViewBox().viewRange()[0]
-        # Step 4: Update PyQtGraph playback indicator
         self.pg_playback_line.setValue(est_pos)
 
     def stop_native(self):
@@ -1417,7 +1442,7 @@ class PitchAccentApp(QMainWindow):
             self.pg_user_plot.clear()
             
             # Add playback line
-            self.pg_user_playback_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('r', width=2))
+            self.pg_user_playback_line = PlaybackIndicator(color='r', width=4)
             self.pg_user_plot.addItem(self.pg_user_playback_line)
             
             # Plot pitch curve more efficiently
