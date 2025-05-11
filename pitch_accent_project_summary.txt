@@ -1,0 +1,62 @@
+
+Pitch Accent Trainer Project Summary
+
+Key Features:
+1. Native Audio Playback:
+   - Users can load native audio files (e.g., .wav, .mp3, .mp4).
+   - The app allows looping of selected sections of the native speaker’s audio for detailed pitch analysis.
+   
+2. User Recording:
+   - Users can record their own pitch curves.
+   - Their recordings are compared against the native speaker's pitch curve.
+   - User recordings are saved to a temporary file, processed to extract pitch contours, and plotted for comparison.
+
+3. Pitch Visualization:
+   - The native speaker's pitch is visualized as a smoothed pitch curve (using parselmouth and scipy for pitch extraction).
+   - The user's pitch is also visualized for comparison.
+
+4. Loop Selection:
+   - Users can interactively select sections of the native audio by clicking and dragging on a plot.
+   - These sections are looped during playback for focused practice.
+   
+5. Playback Control:
+   - The native speaker's audio can be toggled for looped playback.
+   - A countdown timer shows the remaining time while recording.
+
+6. Clear Selection:
+   - There’s a button to clear the selected loop region from the plot. However, issues with this button have been encountered, leading to crashes and lingering visual artifacts.
+
+Project Structure:
+1. GUI Setup:
+   - Tkinter is used for the interface, which includes input/output device selectors, playback controls, buttons for recording, and a plot area for visualizations.
+   - The main canvas is drawn using Matplotlib to display pitch curves for both native and user recordings.
+
+2. Audio Management:
+   - Sounddevice (sd) is used for audio playback and recording.
+   - The audio is processed using Parselmouth for pitch extraction, and SciPy tools for filtering and smoothing the pitch curves.
+   - Audio files can be loaded from various formats, with MoviePy used to extract audio from video files.
+
+3. Pitch Accent Practice:
+   - Users can record their speech, visualize the pitch curve, and compare it to a native speaker's recording.
+   - Pitch curves are plotted dynamically based on the user's interactions with the app.
+
+Known Issues:
+- Clear Selection Bug:
+   - The "Clear Loop Selection" button does not always remove the blue rectangle representing the selected loop area.
+   - Clicking it multiple times or when no loop is selected can crash the app.
+
+- Audio Playback and Synchronization:
+   - The app has had issues with looping native audio, including ensuring that user recordings start and end at the correct times relative to the native audio.
+   - Users reported crashes when interacting with the selection during the playback initialization phase.
+   - Users reported crashes when recording while a selected section of native audio is playing (no crashed without an active selection during playback).
+
+Next Steps for Future Work:
+1. Fixing the "Clear Selection" button:
+   - Ensure that the button removes the blue rectangle properly and doesn't cause crashes when clicked multiple times.
+   - Add additional checks to prevent interaction when no selection is present.
+
+2. Improving Audio Playback Sync:
+   - Ensure smooth synchronization between native audio playback and user recording, especially during loop transitions.
+
+3. Refining UI/UX:
+   - Improve the clarity of visual feedback during interactions and refine the interface for a better user experience.

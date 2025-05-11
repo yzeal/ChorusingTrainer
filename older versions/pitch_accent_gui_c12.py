@@ -1,0 +1,610 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
+from matplotlib.widgets import SpanSelector
+import parselmouth
+import numpy as np
+import threading
+import sounddevice as sd
+import tempfile
+import os
+import scipy.io.wavfile as wavfile
+import time
+from moviepy.editor import AudioFileClip
+from scipy.interpolate import interp1d
+from scipy.signal import medfilt, savgol_filter
+import signal
+
+class PitchAccentApp:
+    def __init__(self, root):
+        self.is_playing_thread_active = False
+        self.root = root
+        self.root.title("Pitch Accent Trainer")
+        
+        # Add proper cleanup on window close
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Add cleanup on Ctrl+C
+        signal.signal(signal.SIGINT, self.signal_handler)
+        
+        self.selection_lock = threading.Lock()  # Add lock for thread safety
+        self.playback_lock = threading.Lock()  # Add lock for playback synchronization
+        self.recording_lock = threading.Lock()  # Add new lock for recording synchronization
+
+        self.native_audio_path = None
+        self.user_audio_path = os.path.join(tempfile.gettempdir(), "user_recording.wav")
+        self.playing = False
+        self.recording = False
+        self.pending_recording = False
+        self.last_native_loop_time = None
+        self.overlay_patch = None
+        self.record_overlay = None
+        self.selection_patch = None
+        self._loop_start = 0.0
+        self._loop_end = None
+
+        self.input_devices = [d for d in sd.query_devices() if d['max_input_channels'] > 0]
+        self.output_devices = [d for d in sd.query_devices() if d['max_output_channels'] > 0]
+
+        self.recording_indicator = None
+        self.blink_state = False
+
+        self.user_playing = False  # Add this to the initialization
+
+        self.setup_gui()
+        self.setup_plot()
+        self.root.bind('<r>', lambda event: self.toggle_recording())
+
+    def setup_gui(self):
+        self.root.geometry("1600x1000")
+
+        top_frame = tk.Frame(self.root)
+        top_frame.pack(side=tk.TOP, fill=tk.X)
+
+        tk.Label(top_frame, text="Input Device:").pack(side=tk.LEFT)
+        self.input_selector = ttk.Combobox(top_frame, values=[d['name'] for d in self.input_devices], state="readonly")
+        self.input_selector.current(0)
+        self.input_selector.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(top_frame, text="Output Device:").pack(side=tk.LEFT)
+        self.output_selector = ttk.Combobox(top_frame, values=[d['name'] for d in self.output_devices], state="readonly")
+        self.output_selector.current(0)
+        self.output_selector.pack(side=tk.LEFT, padx=5)
+
+        middle_frame = tk.Frame(self.root)
+        middle_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.loop_info_label = tk.Label(top_frame, text="Loop: Full clip", font=("Arial", 10))
+        self.loop_info_label.pack(side=tk.RIGHT, padx=10)
+
+        plot_frame = tk.Frame(middle_frame)
+        plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        control_frame = tk.Frame(middle_frame)
+        control_frame.pack(side=tk.RIGHT, fill=tk.Y)
+
+        tk.Label(control_frame, text="Native Controls").pack(pady=(10, 0))
+        tk.Button(control_frame, text="Clear Loop Selection", command=self.clear_selection).pack(pady=2)
+        tk.Button(control_frame, text="Load Native Audio", command=self.load_native).pack(pady=2)
+        self.play_button = tk.Button(control_frame, text="Play", command=self.toggle_native_playback, state=tk.DISABLED)
+        self.play_button.pack(pady=2)
+
+        tk.Label(control_frame, text="User Controls").pack(pady=(20, 0))
+        self.record_frame = tk.Frame(control_frame)
+        self.record_frame.pack(pady=2)
+        self.record_button = tk.Button(self.record_frame, text="Record", command=self.toggle_recording)
+        self.record_button.pack(pady=2)
+        self.play_user_button = tk.Button(control_frame, text="Play Your Recording", command=self.play_user_audio, state=tk.DISABLED)
+        self.play_user_button.pack(pady=2)
+
+        self.fig, (self.ax_native, self.ax_user) = plt.subplots(2, 1, figsize=(12, 8), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.span = SpanSelector(self.ax_native, self.on_select_region, 'horizontal', useblit=True, props=dict(alpha=0.3, facecolor='blue'), interactive=True)
+        self.span_active = False
+        self.canvas.mpl_connect('button_press_event', self.on_mouse_down)
+        self.canvas.mpl_connect('button_release_event', self.on_mouse_up)
+        self.canvas.mpl_connect('button_press_event', self.on_click_outside)
+
+
+    def on_select_region(self, xmin, xmax):
+        if self.is_playing_thread_active:
+            print('Selection blocked during playback initialization')
+            return  # Block interaction during playback initialization
+
+        with self.selection_lock:
+            self._loop_start = max(0.0, xmin)
+            self._loop_end = xmax
+            
+            # Safely handle selection patch
+            try:
+                if hasattr(self, 'selection_patch') and self.selection_patch in self.ax_native.patches:
+                    self.selection_patch.remove()
+                self.selection_patch = self.ax_native.axvspan(self._loop_start, self._loop_end, color='blue', alpha=0.3)
+                self.loop_info_label.config(text=f"Loop: {self._loop_start:.2f}s - {self._loop_end:.2f}s")
+                self.canvas.draw_idle()
+            except Exception as e:
+                print(f"Error updating selection: {e}")
+
+            # Handle playback restart if needed
+            if self.playing:
+                with self.playback_lock:
+                    self.playing = False
+                    sd.stop()
+                    time.sleep(0.1)
+                    self.playing = True
+                    self.root.after(100, lambda: threading.Thread(target=self.loop_native_audio, daemon=True).start())
+
+    def on_mouse_down(self, event):
+        if self.playing:
+            self.playing = False
+            sd.stop()
+            self.play_button.config(text="Play")
+            self.span_active = True
+
+    def on_mouse_up(self, event):
+        if self.span_active:
+            self.span_active = False
+            def resume():
+                time.sleep(1.0)
+                if not self.playing:
+                    self.playing = True
+                    threading.Thread(target=self.loop_native_audio, daemon=True).start()
+            threading.Thread(target=resume, daemon=True).start()
+
+    def on_click_outside(self, event):
+        if event.inaxes != self.ax_native:
+            return
+        if self._loop_end is not None and (event.xdata < self._loop_start or event.xdata > self._loop_end):
+            self.clear_selection()
+
+    def setup_plot(self):
+        self.ax_native.set_title("Native Speaker (Smoothed Pitch)")
+        self.ax_user.set_title("Your Recording (Smoothed Pitch)")
+        self.ax_user.set_xlabel("Time (s)")
+        for ax in (self.ax_native, self.ax_user):
+            ax.set_ylabel("Hz")
+            ax.grid(True)
+
+    def get_selected_devices(self):
+        input_index = self.input_devices[self.input_selector.current()]['index']
+        output_index = self.output_devices[self.output_selector.current()]['index']
+        return input_index, output_index
+
+    def extract_smoothed_pitch(self, path, f0_min=75, f0_max=500):
+        snd = parselmouth.Sound(path)
+        duration = snd.get_total_duration()
+        pitch = snd.to_pitch(time_step=0.01, pitch_floor=f0_min, pitch_ceiling=f0_max)
+        pitch_values = pitch.selected_array['frequency']
+        confidence = pitch.selected_array['strength']
+        times = pitch.xs()
+
+        voiced_indices = np.where((confidence > 0.7) & (pitch_values > 0))[0]
+        if len(voiced_indices) < 4:
+            return times, pitch_values
+
+        n_points = max(4, int(duration * 10))
+        step = max(1, len(voiced_indices) // n_points)
+        selected = voiced_indices[::step]
+
+        x_sparse = times[selected]
+        y_sparse = pitch_values[selected]
+
+        if len(y_sparse) >= 3:
+            y_sparse = medfilt(y_sparse, kernel_size=3)
+
+        if len(x_sparse) >= 4:
+            f_interp = interp1d(x_sparse, y_sparse, kind='cubic', fill_value="extrapolate")
+            x_dense = np.linspace(x_sparse[0], x_sparse[-1], 300)
+            y_dense = f_interp(x_dense)
+
+            if len(y_dense) >= 11:
+                y_dense = savgol_filter(y_dense, window_length=11, polyorder=2)
+
+            return x_dense, y_dense
+        else:
+            return x_sparse, y_sparse
+
+    def clear_selection(self):
+        with self.selection_lock:  # Thread-safe selection clearing
+            self._loop_start = 0.0
+            self._loop_end = None
+            if hasattr(self, 'selection_patch') and self.selection_patch and self.selection_patch in self.ax_native.patches:
+                try:
+                    self.selection_patch.remove()
+                    self.selection_patch = None
+                    self.loop_info_label.config(text="Loop: Full clip")
+                    self.canvas.draw_idle()
+                except Exception as e:
+                    print(f"Error clearing selection: {e}")
+
+            if self.playing:
+                with self.playback_lock:
+                    self.playing = False
+                    sd.stop()
+                    time.sleep(0.1)  # Short delay to ensure audio stops
+                    self.playing = True
+                    self.root.after(100, lambda: threading.Thread(target=self.loop_native_audio, daemon=True).start())
+
+    def load_native(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Audio/Video files", "*.wav *.mp3 *.mp4 *.mov *.avi")])
+        if not file_path:
+            return
+
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in [".mp4", ".mov", ".avi"]:
+            audio = AudioFileClip(file_path)
+            tmp_path = os.path.join(tempfile.gettempdir(), "native_audio.wav")
+            audio.write_audiofile(tmp_path, codec='pcm_s16le')
+            self.native_audio_path = tmp_path
+        else:
+            self.native_audio_path = file_path
+
+        self.clear_selection()
+        self.update_native_plot()
+        self.play_button.config(state=tk.NORMAL)
+
+    def update_native_plot(self):
+        x, y = self.extract_smoothed_pitch(self.native_audio_path)
+        self.ax_native.clear()
+        self.ax_native.plot(x, y, label="Native", linewidth=2)
+        self.overlay_patch = self.ax_native.axvspan(0, 0, color='gray', alpha=0.2)
+        self.ax_native.set_title("Native Speaker (Smoothed Pitch)")
+        self.ax_native.set_ylabel("Hz")
+        self.ax_native.set_xlim(0, x[-1] if len(x) > 0 else 0)
+        self.ax_native.legend()
+        self.ax_native.grid(True)
+        self.canvas.draw()
+        self.native_duration = x[-1] if len(x) > 0 else 0
+
+    def toggle_native_playback(self):
+        if not self.native_audio_path:
+            return
+        self.playing = not self.playing
+        if self.playing:
+            self.play_button.config(text="Stop")
+            threading.Thread(target=self.loop_native_audio, daemon=True).start()
+        else:
+            self.play_button.config(text="Play")
+            sd.stop()
+            # Let the loop_native_audio handle the overlay removal
+            # since it's already in its finally block
+
+    def loop_native_audio(self):
+        with self.playback_lock:
+            self.is_playing_thread_active = True
+            try:
+                snd = parselmouth.Sound(self.native_audio_path)
+                sr = snd.sampling_frequency
+                total_duration = snd.get_total_duration()
+
+                # Safely get selection bounds
+                with self.selection_lock:
+                    start_sample = int(self._loop_start * sr)
+                    end_sample = int(self._loop_end * sr) if self._loop_end else len(snd.values[0])
+                
+                y = snd.values[0][start_sample:end_sample]
+                duration = (end_sample - start_sample) / sr
+                self.native_duration = duration
+
+                _, output_index = self.get_selected_devices()
+
+                while self.playing:
+                    self.last_native_loop_time = time.time()
+                    sd.play(y, sr, device=output_index)
+                    start_time = self.last_native_loop_time
+                    
+                    while time.time() - start_time < duration and self.playing:
+                        current = time.time() - start_time
+                        self.root.after(0, lambda t=current: self.update_playback_overlay(t))
+                        time.sleep(0.03)
+                    
+                    if self.playing:  # Check if we should continue looping
+                        sd.stop()
+                        self.update_playback_overlay(0)
+                
+            except Exception as e:
+                print(f"Error in audio playback: {e}")
+            finally:
+                self.is_playing_thread_active = False
+                # Safely remove overlay when playback thread ends
+                def safe_remove_overlay():
+                    try:
+                        if hasattr(self, 'overlay_patch') and self.overlay_patch in self.ax_native.patches:
+                            self.overlay_patch.remove()
+                            self.canvas.draw_idle()
+                    except Exception as e:
+                        print(f"Error removing overlay: {e}")
+                
+                self.root.after(0, safe_remove_overlay)
+
+    def update_playback_overlay(self, current_time):
+        try:
+            if self.overlay_patch in self.ax_native.patches:
+                self.overlay_patch.remove()
+        except Exception as e:
+            print("Overlay removal error:", e)
+        start = self._loop_start if self._loop_end else 0
+        self.overlay_patch = self.ax_native.axvspan(start, start + current_time, color='gray', alpha=0.2)
+        self.canvas.draw_idle()
+
+    def toggle_recording(self):
+        self.record_audio()
+
+    def record_audio(self):
+        if self.recording or self.pending_recording:
+            print("Recording or timer already active.")
+            return
+
+        with self.recording_lock:  # Protect recording state
+            self.recording = True
+            
+        with self.selection_lock:  # Safely get current selection state
+            current_loop_start = self._loop_start
+            current_loop_end = self._loop_end
+            
+        self.ax_user.clear()
+        self.ax_user.grid(True)
+        self.ax_user.set_ylim(50, 500)
+        self.ax_user.set_xlim(0, 5)
+        self.ax_user.set_title("Your Recording (Real-time Pitch)")
+        self.ax_user.set_ylabel("Hz")
+        self.canvas.draw()
+        
+        # Disable both recording and playback buttons
+        self.record_button.pack_forget()
+        self.play_user_button.config(state=tk.DISABLED)
+        self.countdown_label = tk.Label(self.record_frame, text="Recording...", font=("Arial", 12))
+        self.countdown_label.pack(pady=2)
+        self.record_button.config(state=tk.DISABLED)
+
+        try:
+            input_index, _ = self.get_selected_devices()
+            fs = 22050
+            chunk_duration = 0.2  # Reduced from 0.5s to 0.2s for more frequent updates
+            chunk_samples = int(fs * chunk_duration)
+            padding = 2.0
+            duration = (self.native_duration + padding) if hasattr(self, 'native_duration') else 6
+            frames = []
+            pitch_buffer = []
+            
+            def update_realtime_pitch():
+                if not frames:  # No audio data yet
+                    return
+                
+                try:
+                    # Get all audio data so far
+                    all_audio = np.concatenate(frames, axis=0).squeeze()
+                    temp_file = os.path.join(tempfile.gettempdir(), "temp_chunk.wav")
+                    wavfile.write(temp_file, fs, all_audio)
+                    
+                    # Extract pitch
+                    x, y = self.extract_smoothed_pitch(temp_file)
+                    current_time = len(frames) * chunk_samples / fs
+                    
+                    # Update plot
+                    self.ax_user.clear()
+                    self.ax_user.grid(True)
+                    self.ax_user.set_title("Your Recording (Real-time Pitch)")
+                    self.ax_user.set_ylabel("Hz")
+                    self.ax_user.set_ylim(50, 500)
+                    
+                    # Plot the pitch curve
+                    self.ax_user.plot(x, y, color='orange', linewidth=2)
+                    self.ax_user.set_xlim(max(0, current_time - 5), current_time + 1)
+                    
+                    # Add recording indicator as fixed annotation
+                    self.recording_indicator = self.ax_user.annotate(
+                        '●',  # Unicode bullet point as dot
+                        xy=(0.01, 0.93),  # Position in axes coordinates (0-1)
+                        xycoords='axes fraction',  # Use relative coordinates
+                        color='red',
+                        fontsize=20,
+                        annotation_clip=False  # Ensure it's always visible
+                    )
+                    
+                    self.canvas.draw_idle()
+                    
+                except Exception as e:
+                    print(f"Error in update_realtime_pitch: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            def callback(indata, frames_, time_, status):
+                if status:
+                    # Only keep critical error messages
+                    if status.error():
+                        print(f"Critical error in audio callback: {status}")
+                
+                # Append the new audio chunk
+                frames.append(indata.copy())
+                
+                # Update visualization every chunk_duration seconds
+                if len(frames) * chunk_samples / fs >= len(pitch_buffer) * chunk_duration:
+                    self.root.after(1, update_realtime_pitch)
+
+            def update_countdown(start_time):
+                remaining = max(0, int(duration - (time.time() - start_time)))
+                self.countdown_label.config(text=f"Recording... {remaining}s")
+                if remaining > 0 and self.recording:
+                    self.root.after(1000, update_countdown, start_time)
+
+            def start_recording():
+                nonlocal frames
+                frames = []  # Reset frames
+                
+                try:
+                    # Reset pending_recording state at the start
+                    self.pending_recording = False
+                    
+                    with sd.InputStream(samplerate=fs, channels=1, dtype='float32',
+                                      callback=callback, device=input_index,
+                                      blocksize=chunk_samples):
+                        start_time = time.time()
+                        update_countdown(start_time)
+                        while time.time() - start_time < duration and self.recording:
+                            sd.sleep(50)
+                            
+                    if frames:
+                        audio = np.concatenate(frames, axis=0).squeeze()
+                        wavfile.write(self.user_audio_path, fs, audio)
+                        # Schedule UI updates in main thread
+                        self.root.after(0, lambda: self.finish_recording())
+                    
+                except Exception as e:
+                    print(f"Error in start_recording: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Schedule cleanup in main thread even on error
+                    self.root.after(0, lambda: self.finish_recording())
+                finally:
+                    self.recording = False
+                    self.pending_recording = False
+
+            if self.playing and self.last_native_loop_time:
+                now = time.time()
+                time_since_loop = now - self.last_native_loop_time
+                time_until_next_loop = self.native_duration - (time_since_loop % self.native_duration)
+                self.pending_recording = True  # Set the pending flag
+                threading.Timer(time_until_next_loop, start_recording).start()
+            else:
+                threading.Thread(target=start_recording, daemon=True).start()
+
+        except Exception as e:
+            print(f"Recording setup error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.recording = False
+            self.pending_recording = False  # Make sure to reset in case of setup error
+
+    def update_user_plot(self):
+        x, y = self.extract_smoothed_pitch(self.user_audio_path)
+        self.ax_user.clear()
+        self.ax_user.plot(x, y, label="User", color="orange", linewidth=2)
+        self.ax_user.set_title("Your Recording (Smoothed Pitch)")
+        self.ax_user.set_ylabel("Hz")
+        self.ax_user.set_xlabel("Time (s)")
+        self.ax_user.legend()
+        self.ax_user.grid(True)
+        self.canvas.draw()
+
+    def play_user_audio(self):
+        if not os.path.exists(self.user_audio_path):
+            messagebox.showerror("Error", "No user recording found.")
+            return
+            
+        self.user_playing = True  # Add a flag for user audio playback
+        threading.Thread(target=self.loop_user_audio, daemon=True).start()
+
+    def loop_user_audio(self):
+        try:
+            snd = parselmouth.Sound(self.user_audio_path)
+            y = snd.values[0]
+            sr = snd.sampling_frequency
+            duration = snd.get_total_duration()
+            _, output_index = self.get_selected_devices()
+            
+            sd.play(y, sr, device=output_index)
+            start_time = time.time()
+            
+            while time.time() - start_time < duration and self.user_playing:
+                current = time.time() - start_time
+                self.root.after(0, lambda t=current: self.update_user_playback_overlay(t))
+                time.sleep(0.03)
+                
+        except Exception as e:
+            print(f"Error in user audio playback: {e}")
+        finally:
+            self.user_playing = False
+            sd.stop()
+            # Safely remove overlay when playback ends
+            def safe_remove_user_overlay():
+                try:
+                    if hasattr(self, 'user_overlay_patch') and self.user_overlay_patch in self.ax_user.patches:
+                        self.user_overlay_patch.remove()
+                        self.canvas.draw_idle()
+                except Exception as e:
+                    print(f"Error removing user overlay: {e}")
+            
+            self.root.after(0, safe_remove_user_overlay)
+
+    def update_user_playback_overlay(self, current_time):
+        try:
+            if hasattr(self, 'user_overlay_patch') and self.user_overlay_patch in self.ax_user.patches:
+                self.user_overlay_patch.remove()
+        except Exception as e:
+            print("User overlay removal error:", e)
+        self.user_overlay_patch = self.ax_user.axvspan(0, current_time, color='gray', alpha=0.2)
+        self.canvas.draw_idle()
+
+    def update_record_overlay(self, current_time, duration):
+        # Temporarily disabled
+        pass
+
+    def on_closing(self):
+        """Clean up and close the application"""
+        print("Cleaning up...")
+        try:
+            # Stop any ongoing playback
+            self.playing = False
+            sd.stop()
+            self.play_button.config(text="Play")
+            
+            # Stop any ongoing recording
+            self.recording = False
+            self.pending_recording = False
+            
+            # Destroy all matplotlib figures
+            plt.close('all')
+            
+            # Destroy the root window
+            self.root.destroy()
+            
+            # Force exit the application
+            os._exit(0)
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+            os._exit(1)
+
+    def signal_handler(self, sig, frame):
+        """Handle Ctrl+C signal"""
+        print("\nCtrl+C detected. Cleaning up...")
+        self.on_closing()
+
+    def finish_recording(self):
+        """Handle recording cleanup in the main thread"""
+        try:
+            if hasattr(self, 'countdown_label'):
+                self.countdown_label.destroy()
+                delattr(self, 'countdown_label')
+            
+            self.record_button.config(state=tk.NORMAL)
+            self.record_button.pack(pady=2)
+            
+            # Clear the recording indicator by updating the plot
+            if os.path.exists(self.user_audio_path):
+                self.play_user_button.config(state=tk.NORMAL)
+                self.update_user_plot()
+            else:
+                # If no recording was saved, just clear the plot
+                self.ax_user.clear()
+                self.ax_user.grid(True)
+                self.ax_user.set_title("Your Recording (Smoothed Pitch)")
+                self.ax_user.set_ylabel("Hz")
+                self.ax_user.set_ylim(50, 500)
+                self.canvas.draw_idle()
+                
+        except Exception as e:
+            print(f"Error in finish_recording cleanup: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = PitchAccentApp(root)
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        app.on_closing()
