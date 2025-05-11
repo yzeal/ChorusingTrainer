@@ -34,6 +34,8 @@ import moviepy
 import shutil
 import traceback
 
+pg.setConfigOptions(useOpenGL=True)
+
 if getattr(sys, 'frozen', False):
     # Running in a bundle
     ffmpeg_path = os.path.join(os.path.dirname(sys.executable), 'ffmpeg.exe')
